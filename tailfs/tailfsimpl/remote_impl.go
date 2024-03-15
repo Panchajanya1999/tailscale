@@ -5,6 +5,7 @@ package tailfsimpl
 
 import (
 	"bufio"
+	"context"
 	"encoding/hex"
 	"fmt"
 	"log"
@@ -15,6 +16,8 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/user"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -50,7 +53,7 @@ type FileSystemForRemote struct {
 	// them, acquire a read lock before reading any of them.
 	mu             sync.RWMutex
 	fileServerAddr string
-	shares         map[string]*tailfs.Share
+	shares         []*tailfs.Share
 	children       map[string]*compositedav.Child
 	userServers    map[string]*userServer
 }
@@ -62,16 +65,26 @@ func (s *FileSystemForRemote) SetFileServerAddr(addr string) {
 	s.mu.Unlock()
 }
 
-// SetShares implements tailfs.FileSystemForRemote.
-func (s *FileSystemForRemote) SetShares(shares map[string]*tailfs.Share) {
+// SetShares implements tailfs.FileSystemForRemote. Shares must be sorted
+// according to tailfs.CompareShares.
+func (s *FileSystemForRemote) SetShares(shares []*tailfs.Share) {
 	userServers := make(map[string]*userServer)
 	if tailfs.AllowShareAs() {
-		// set up per-user server
+		// Set up per-user server by running the current executable as an
+		// unprivileged user in order to avoid privilege escalation.
+		executable, err := os.Executable()
+		if err != nil {
+			s.logf("can't find executable: %v", err)
+			return
+		}
+
 		for _, share := range shares {
 			p, found := userServers[share.As]
 			if !found {
 				p = &userServer{
-					logf: s.logf,
+					logf:       s.logf,
+					username:   share.As,
+					executable: executable,
 				}
 				userServers[share.As] = p
 			}
@@ -120,7 +133,13 @@ func (s *FileSystemForRemote) buildChild(share *tailfs.Share) *compositedav.Chil
 				shareName := string(shareNameBytes)
 
 				s.mu.RLock()
-				share, shareFound := s.shares[shareName]
+				var share *tailfs.Share
+				i, shareFound := slices.BinarySearchFunc(s.shares, shareName, func(s *tailfs.Share, name string) int {
+					return strings.Compare(s.Name, name)
+				})
+				if shareFound {
+					share = s.shares[i]
+				}
 				userServers := s.userServers
 				fileServerAddr := s.fileServerAddr
 				s.mu.RUnlock()
@@ -227,8 +246,10 @@ func (s *FileSystemForRemote) Close() error {
 // given Shares. All Shares are assumed to have the same Share.As, and the
 // content is served as that Share.As user.
 type userServer struct {
-	logf   logger.Logf
-	shares []*tailfs.Share
+	logf       logger.Logf
+	shares     []*tailfs.Share
+	username   string
+	executable string
 
 	// mu guards the below values. Acquire a write lock before updating any of
 	// them, acquire a read lock before reading any of them.
@@ -251,11 +272,6 @@ func (s *userServer) Close() error {
 }
 
 func (s *userServer) runLoop() {
-	executable, err := os.Executable()
-	if err != nil {
-		s.logf("can't find executable: %v", err)
-		return
-	}
 	maxSleepTime := 30 * time.Second
 	consecutiveFailures := float64(0)
 	var timeOfLastFailure time.Time
@@ -267,7 +283,7 @@ func (s *userServer) runLoop() {
 			return
 		}
 
-		err := s.run(executable)
+		err := s.run()
 		now := time.Now()
 		timeSinceLastFailure := now.Sub(timeOfLastFailure)
 		timeOfLastFailure = now
@@ -280,22 +296,37 @@ func (s *userServer) runLoop() {
 		if sleepTime > maxSleepTime {
 			sleepTime = maxSleepTime
 		}
-		s.logf("user server % v stopped with error %v, will try again in %v", executable, err, sleepTime)
+		s.logf("user server % v stopped with error %v, will try again in %v", s.executable, err, sleepTime)
 		time.Sleep(sleepTime)
 	}
 }
 
-// Run runs the executable (tailscaled). This function only works on UNIX systems,
-// but those are the only ones on which we use userServers anyway.
-func (s *userServer) run(executable string) error {
+// Run runs the user server using the configured executable. This function only
+// works on UNIX systems, but those are the only ones on which we use
+// userServers anyway.
+func (s *userServer) run() error {
 	// set up the command
 	args := []string{"serve-tailfs"}
 	for _, s := range s.shares {
 		args = append(args, s.Name, s.Path)
 	}
-	allArgs := []string{"-u", s.shares[0].As, executable}
-	allArgs = append(allArgs, args...)
-	cmd := exec.Command("sudo", allArgs...)
+	var cmd *exec.Cmd
+	if s.canSudo() {
+		s.logf("starting TailFS file server as user %q", s.username)
+		allArgs := []string{"-n", "-u", s.username, s.executable}
+		allArgs = append(allArgs, args...)
+		cmd = exec.Command("sudo", allArgs...)
+	} else {
+		// If we were root, we should have been able to sudo as a specific
+		// user, but let's check just to make sure, since we never want to
+		// access shared folders as root.
+		err := s.assertNotRoot()
+		if err != nil {
+			return err
+		}
+		s.logf("starting TailFS file server as ourselves")
+		cmd = exec.Command(s.executable, args...)
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("stdout pipe: %w", err)
@@ -349,4 +380,33 @@ var writeMethods = map[string]bool{
 	"MKCOL":     true,
 	"MOVE":      true,
 	"PROPPATCH": true,
+}
+
+// canSudo checks wether we can sudo -u the configured executable as the
+// configured user by attempting to call the executable with the '-h' flag to
+// print help.
+func (s *userServer) canSudo() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := exec.CommandContext(ctx, "sudo", "-n", "-u", s.username, s.executable, "-h").Run(); err != nil {
+		return false
+	}
+	return true
+}
+
+// assertNotRoot returns an error if the current user has UID 0 or if we cannot
+// determine the current user.
+//
+// On Linux, root users will always have UID 0.
+//
+// On BSD, root users should always have UID 0.
+func (s *userServer) assertNotRoot() error {
+	u, err := user.Current()
+	if err != nil {
+		return fmt.Errorf("assertNotRoot failed to find current user: %s", err)
+	}
+	if u.Uid == "0" {
+		return fmt.Errorf("%q is root", u.Name)
+	}
+	return nil
 }

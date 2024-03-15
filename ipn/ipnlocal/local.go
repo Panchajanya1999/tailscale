@@ -308,6 +308,10 @@ type LocalBackend struct {
 
 	// Last ClientVersion received in MapResponse, guarded by mu.
 	lastClientVersion *tailcfg.ClientVersion
+
+	// lastNotifiedTailFSShares keeps track of the last set of shares that we
+	// notified about.
+	lastNotifiedTailFSShares atomic.Pointer[views.SliceView[*tailfs.Share, tailfs.ShareView]]
 }
 
 type updateStatus struct {
@@ -431,10 +435,12 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 	// initialize TailFS shares from saved state
 	fs, ok := b.sys.TailFSForRemote.GetOK()
 	if ok {
-		b.mu.Lock()
-		shares, err := b.tailFSGetSharesLocked()
-		b.mu.Unlock()
-		if err == nil && len(shares) > 0 {
+		currentShares := b.pm.prefs.TailFSShares()
+		if currentShares.Len() > 0 {
+			var shares []*tailfs.Share
+			for i := 0; i < currentShares.Len(); i++ {
+				shares = append(shares, currentShares.At(i).AsStruct())
+			}
 			fs.SetShares(shares)
 		}
 	}
@@ -2283,15 +2289,7 @@ func (b *LocalBackend) WatchNotifications(ctx context.Context, mask ipn.NotifyWa
 			ini.NetMap = b.netMap
 		}
 		if mask&ipn.NotifyInitialTailFSShares != 0 && b.tailFSSharingEnabledLocked() {
-			shares, err := b.tailFSGetSharesLocked()
-			if err != nil {
-				b.logf("unable to notify initial tailfs shares: %v", err)
-			} else {
-				ini.TailFSShares = make(map[string]*tailfs.Share, len(shares))
-				for _, share := range shares {
-					ini.TailFSShares[share.Name] = share
-				}
-			}
+			ini.TailFSShares = b.pm.prefs.TailFSShares()
 		}
 	}
 
@@ -2367,6 +2365,20 @@ func (b *LocalBackend) pollRequestEngineStatus(ctx context.Context) {
 // It should only be used via the LocalAPI's debug handler.
 func (b *LocalBackend) DebugNotify(n ipn.Notify) {
 	b.send(n)
+}
+
+// DebugNotifyLastNetMap injects a fake notify message to clients,
+// repeating whatever the last netmap was.
+//
+// It should only be used via the LocalAPI's debug handler.
+func (b *LocalBackend) DebugNotifyLastNetMap() {
+	b.mu.Lock()
+	nm := b.netMap
+	b.mu.Unlock()
+
+	if nm != nil {
+		b.send(ipn.Notify{NetMap: nm})
+	}
 }
 
 // DebugForceNetmapUpdate forces a full no-op netmap update of the current
@@ -2491,11 +2503,21 @@ func (b *LocalBackend) validPopBrowserURL(urlStr string) bool {
 	if err != nil {
 		return false
 	}
+	serverURL := b.Prefs().ControlURLOrDefault()
+	if ipn.IsLoginServerSynonym(serverURL) {
+		// When connected to the official Tailscale control plane, only allow
+		// URLs from tailscale.com or its subdomains.
+		if h := u.Hostname(); h != "tailscale.com" && !strings.HasSuffix(u.Hostname(), ".tailscale.com") {
+			return false
+		}
+		// When using a different ControlURL, we cannot be sure what legitimate
+		// PopBrowserURLs they will send. Allow any domain there to avoid
+		// breaking existing user setups.
+	}
 	switch u.Scheme {
 	case "https":
 		return true
 	case "http":
-		serverURL := b.Prefs().ControlURLOrDefault()
 		// If the control server is using plain HTTP (likely a dev server),
 		// then permit http://.
 		return strings.HasPrefix(serverURL, "http://")
@@ -4667,10 +4689,8 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 		}
 	}
 
-	if b.tailFSSharingEnabledLocked() {
-		b.updateTailFSPeersLocked(nm)
-		b.tailFSNotifyCurrentSharesLocked()
-	}
+	b.updateTailFSPeersLocked(nm)
+	b.tailFSNotifyCurrentSharesLocked()
 }
 
 func (b *LocalBackend) updatePeersFromNetmapLocked(nm *netmap.NetworkMap) {
